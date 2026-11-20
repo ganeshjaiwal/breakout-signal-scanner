@@ -1,0 +1,15 @@
+# Runtime output: logs, scan results, signal state (each machine keeps its own)
+autoscan/data/
+autoscan/cron.log
+autoscan/trader/
+day-trader-skill/trader/
+trader/
+
+# Build output
+*.tar.gz
+__pycache__/
+*.pyc
+
+# Secrets never live here (Telegram settings are in ~/.config/day-trader/), but just in case
+*.env
+.env*
