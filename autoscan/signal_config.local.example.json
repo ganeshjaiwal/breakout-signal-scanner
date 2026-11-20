@@ -1,0 +1,8 @@
+{
+  "sizing": {
+    "NSE": {
+      "budget": 2000,
+      "max_loss": 250
+    }
+  }
+}

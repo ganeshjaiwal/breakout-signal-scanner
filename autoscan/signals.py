@@ -27,7 +27,8 @@ ENTRY = os.path.join(SKILLS, "trader-entry", "entry.py")
 EXIT = os.path.join(SKILLS, "trader-exit", "exit.py")
 TIMEMACHINE = os.path.join(SKILLS, "trader-timemachine", "timemachine.py")
 NEWS = os.path.join(SKILLS, "trader-news", "news.py")
-CONFIG = os.path.join(HERE, "signal_config.json")
+CONFIG = os.path.join(HERE, "signal_config.json")              # shared defaults, in git
+LOCAL_CONFIG = os.path.join(HERE, "signal_config.local.json")  # your own settings, not in git
 
 DEFAULTS = {
     "alerts": "signals",          # "signals": only trade signals. "all": also every breakout and the daily setups
@@ -83,14 +84,24 @@ def position(size, buy_hi, stop, target):
 
 
 def load_config():
-    cfg = dict(DEFAULTS)
-    try:
-        with open(CONFIG) as fh:
-            doc = json.load(fh)
-        if isinstance(doc, dict):
-            cfg.update({k: v for k, v in doc.items() if k in DEFAULTS})
-    except (OSError, ValueError):
-        pass
+    """DEFAULTS, then signal_config.json, then signal_config.local.json. A dict setting
+    (like "swing" or "sizing") is merged key by key, so a local file can change one value."""
+    cfg = json.loads(json.dumps(DEFAULTS))
+    for path in (CONFIG, LOCAL_CONFIG):
+        try:
+            with open(path) as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        for k, v in doc.items():
+            if k not in DEFAULTS:
+                continue
+            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                cfg[k] = dict(cfg[k], **v)
+            else:
+                cfg[k] = v
     return cfg
 
 

@@ -1,6 +1,7 @@
 # Runtime output: logs, scan results, signal state (each machine keeps its own)
 autoscan/data/
 autoscan/cron.log
+autoscan/update.log
 autoscan/trader/
 day-trader-skill/trader/
 trader/
@@ -13,3 +14,6 @@ __pycache__/
 # Secrets never live here (Telegram settings are in ~/.config/day-trader/), but just in case
 *.env
 .env*
+
+# Your own settings (copy signal_config.local.example.json)
+autoscan/signal_config.local.json

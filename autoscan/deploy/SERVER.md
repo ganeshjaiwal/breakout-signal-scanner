@@ -38,35 +38,25 @@ Never put broker or Alpaca keys on this server: it only scans.
 3. In a browser, open `https://api.telegram.org/bot<TOKEN>/getUpdates` (your token in place of
    `<TOKEN>`). Find `"chat":{"id":` and copy the number after it: that is your **chat id**.
 
-## 3. Pack and copy (on your computer)
-
-```bash
-bash ~/Ganesh_WS_UB/Day-trader/autoscan/deploy/make-bundle.sh
-```
-
-```bash
-scp ~/Ganesh_WS_UB/Day-trader/day-trader-autoscan.tar.gz USER@SERVER:~/
-```
-
-## 4. Install (on the server)
+## 3. Install (on the server)
 
 ```bash
 ssh USER@SERVER
 ```
 
 ```bash
-sudo apt update && sudo apt install -y python3 tzdata cron
+sudo apt update && sudo apt install -y python3 tzdata cron git
 ```
 
 ```bash
-mkdir -p ~/day-trader && tar -xzf ~/day-trader-autoscan.tar.gz -C ~/day-trader
+git clone https://github.com/ganeshjaiwal/breakout-signal-scanner.git ~/breakout-signal-scanner
 ```
 
 ```bash
-bash ~/day-trader/autoscan/deploy/install.sh
+bash ~/breakout-signal-scanner/autoscan/deploy/install.sh
 ```
 
-The first run creates `~/.config/day-trader/telegram.env` and installs the cron job.
+The first run creates `~/.config/day-trader/telegram.env` and installs the cron jobs.
 Put your token and chat id in it:
 
 ```bash
@@ -78,10 +68,35 @@ both markets, sends you a Telegram test message and prints when each market
 scans next:
 
 ```bash
-bash ~/day-trader/autoscan/deploy/install.sh
+bash ~/breakout-signal-scanner/autoscan/deploy/install.sh
 ```
 
-## 5. Stop the copy on your computer
+Optional: your own budget and settings, kept out of git:
+
+```bash
+cp ~/breakout-signal-scanner/autoscan/signal_config.local.example.json ~/breakout-signal-scanner/autoscan/signal_config.local.json
+```
+
+## 4. Updates
+
+The installer adds a second cron job that runs `deploy/update.sh` every day at
+07:00 IST, when both markets are closed. It pulls `main` from GitHub, checks the
+new code compiles and loads, and rolls back by itself if it doesn't. Its output
+goes to `autoscan/update.log`. To update now, or just see what's waiting:
+
+```bash
+bash ~/breakout-signal-scanner/autoscan/deploy/update.sh
+bash ~/breakout-signal-scanner/autoscan/deploy/update.sh --check
+```
+
+Don't edit tracked files on the server: a local change blocks updates. Put your
+settings in `signal_config.local.json` instead.
+
+**No git on the server?** Run `bash autoscan/deploy/make-bundle.sh` on your computer,
+copy the `.tar.gz` over, unpack it and run `install.sh` from it. That copy does not
+update itself: repeat the steps to update.
+
+## 5. If you ran it on your computer before
 
 Once the server's test message arrives, remove the cron job on your computer,
 or every alert comes twice:
@@ -90,15 +105,10 @@ or every alert comes twice:
 crontab -l | grep -v 'autoscan' | crontab -
 ```
 
-The Claude summary task ("Day trader autoscan: daily summary") reads files on
-your computer, so it will find nothing once the server takes over: the server's
-end-of-day Telegram report replaces it. Turn the task off in the app's
-Scheduled section.
-
 ## Everyday use (on the server)
 
 ```bash
-cd ~/day-trader/autoscan
+cd ~/breakout-signal-scanner/autoscan
 python3 autoscan.py next                    # when each market scans next
 python3 autoscan.py summary                 # today's hits
 python3 autoscan.py report --market NSE --print
@@ -106,14 +116,13 @@ tail -n 50 cron.log                         # errors land here
 tail -n 30 data/us/log/$(date +%F).log
 ```
 
-**Update** after changing anything on your computer: run steps 3 and 4 again
-(the same `tar` and `install.sh` commands). Logs and results on the server are kept.
+**Update:** automatic every morning; see step 4.
 
-**Lists:** `~/day-trader/autoscan/lists/nifty50.txt` and `us.txt`, one symbol a line.
+**Lists:** `autoscan/lists/nifty50.txt` and `us.txt` (change them in the repository), one symbol a line.
 NSE changes the NIFTY 50 in March and September.
 
 **Holidays:** NSE has not published 2027 yet. When it does, add the dates to
-`NSE_HOLIDAYS` in `day-trader-skill/skills/trader-scanner/scan.py` and update the server.
+`NSE_HOLIDAYS` in `day-trader-skill/skills/trader-scanner/scan.py` and the other skill scripts, then push.
 
 ## If something goes wrong
 

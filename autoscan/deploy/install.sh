@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Run ON THE SERVER, from the unpacked bundle:
-#   mkdir -p ~/day-trader && tar -xzf ~/day-trader-autoscan.tar.gz -C ~/day-trader
-#   bash ~/day-trader/autoscan/deploy/install.sh
-# Safe to run again (after an update): it replaces only its own cron line.
+# Run ON THE SERVER, from a clone of the repository (recommended):
+#   git clone https://github.com/ganeshjaiwal/breakout-signal-scanner.git ~/breakout-signal-scanner
+#   bash ~/breakout-signal-scanner/autoscan/deploy/install.sh
+# or from an unpacked bundle made by make-bundle.sh (no automatic updates then).
+# Safe to run again: it replaces only its own cron lines.
 set -euo pipefail
 A=$(cd "$(dirname "$0")/.." && pwd)                 # .../autoscan
 ENVF="$HOME/.config/day-trader/telegram.env"
@@ -49,6 +50,22 @@ LINE="*/5 * * * * cd $A && $PY autoscan.py tick >> $A/cron.log 2>&1"
 { crontab -l 2>/dev/null | grep -v 'autoscan.py tick' | grep -v '^# Day trader autoscan' || true
   echo "# Day trader autoscan (installed by deploy/install.sh)"; echo "$LINE"; } | crontab -
 crontab -l | grep 'autoscan.py tick'
+
+REPO=$(cd "$A/.." && pwd)
+if [ -d "$REPO/.git" ]; then
+  say "Installing the daily update from GitHub (07:00 IST, when both markets are closed)"
+  # 07:00 IST = 01:30 UTC, written in this server's own time zone
+  read -r UM UH <<<"$("$PY" -c "
+import datetime
+t = datetime.datetime.now(datetime.timezone.utc).replace(hour=1, minute=30).astimezone()
+print(t.minute, t.hour)")"
+  ULINE="$UM $UH * * * bash $A/deploy/update.sh >> $A/update.log 2>&1"
+  { crontab -l 2>/dev/null | grep -v 'deploy/update.sh' || true; echo "$ULINE"; } | crontab -
+  crontab -l | grep 'deploy/update.sh'
+  bash "$A/deploy/update.sh" --check || true
+else
+  echo "(not a git clone: no automatic updates; see deploy/SERVER.md)"
+fi
 
 say "Test scan (daily setups, both markets; notifications are not sent)"
 cd "$A"

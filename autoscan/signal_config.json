@@ -19,12 +19,7 @@
   "block_news_tags": [
     "halt"
   ],
-  "sizing": {
-    "NSE": {
-      "budget": 2000,
-      "max_loss": 250
-    }
-  },
+  "sizing": {},
   "swing": {
     "enabled": true,
     "range": "5y",

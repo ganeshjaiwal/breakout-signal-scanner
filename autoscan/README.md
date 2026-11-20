@@ -38,7 +38,7 @@ The message gives the buy range, sell range, stop loss and confidence. Confidenc
 number from replays of past prices, not a promise: signals will lose sometimes. The
 end-of-day report shows how each signal ended, which is the real track record.
 
-Position size: `"sizing": {"NSE": {"budget": 2000, "max_loss": 250}}` in `signal_config.json`
+Position size: `"sizing": {"NSE": {"budget": 2000, "max_loss": 250}}` in `signal_config.local.json` (your own file, not in git)
 adds a quantity line to NSE signals: whole shares, cash only, sized at the top of the buy
 range so that the cost fits the budget and the loss at the stop fits the max loss. A stock
 whose single share costs more than the budget is skipped. Charges shown are an estimate at
@@ -90,8 +90,6 @@ python3 autoscan.py test-notify
 - `data/<market>/results/DATE/HHMM-mode.json`: full scanner output
 - `cron.log`: cron's own output (errors land here)
 
-A Claude scheduled task, "Day trader autoscan: daily summary", sums up the previous
-day at 08:30 IST, Tuesday to Saturday.
 
 ## Turn it off
 
