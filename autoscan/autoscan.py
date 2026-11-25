@@ -323,14 +323,24 @@ def run_swing(market, day, dry=False):
         len(live), as_of, failed, len(symbols(market))))
     picks = []
     if len(still) < sc["max_open"]:
-        picks = swing.choose(live, pool, sc, (cfg.get("sizing") or {}).get(market),
-                             skip={p["symbol"] for p in still}, log=say, cfg=cfg,
-                             market=market)[:sc["max_signals_per_day"]]
-        picks = picks[:max(0, sc["max_open"] - len(still))]
+        ranked = swing.choose(live, pool, sc, (cfg.get("sizing") or {}).get(market),
+                              skip={p["symbol"] for p in still}, log=say, cfg=cfg, market=market)
+        room = min(sc["max_signals_per_day"], max(0, sc["max_open"] - len(still)))
+        ndir = os.path.join(market_dir(market), "swing-news")
+        os.makedirs(ndir, exist_ok=True)
+        for s in ranked:   # best first; the news check runs only until there are enough picks
+            if len(picks) >= room:
+                break
+            blocked, note = signals.news_check(s["symbol"], ndir, cfg, market)
+            if blocked:
+                say("swing %s %s dropped: %s" % (s["symbol"], s["setup"], blocked))
+                continue
+            s["note"] = note
+            picks.append(s)
     else:
         say("swing: %d trades already open (limit %d), no new signal" % (len(still), sc["max_open"]))
     for s in picks:
-        title, body = swing.message(market, m["label"], show(s["symbol"]), s, sc["hold_days"], mod)
+        title, body = swing.message(market, m["label"], show(s["symbol"]), s, sc["hold_days"], mod, s.get("note"))
         if dry:
             print("\n" + title + "\n" + body)
             continue

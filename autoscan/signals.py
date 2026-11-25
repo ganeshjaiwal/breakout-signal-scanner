@@ -16,10 +16,17 @@ the stop and before the flat-by time. It is a number from a simulation of past
 price moves, not a promise: a signal can and will lose.
 """
 import datetime
+import email.utils
+import importlib.util
 import json
+import math
 import os
+import re
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
 
 import ml
@@ -47,7 +54,8 @@ DEFAULTS = {
     "max_candidates_per_scan": 12,
     "max_signals_per_day": 2,     # per market
     "replays": 10000,
-    "block_news_tags": ["halt"],
+    "block_news_tags": ["halt", "risk"],   # any headline with one of these tags blocks the signal
+    "block_negative_news": True,  # block when the day's headlines read more bad than good (see NEG_WORDS)
     # Position size per market, cash only, whole shares: {"NSE": {"budget": 2000, "max_loss": 250}}.
     # A market with no entry gets no quantity line. Amounts are in the stock's own currency.
     "sizing": {},
@@ -148,6 +156,7 @@ def evaluate(sym, workdir, cfg, now=None, size=None, market=None):
 
     best = None
     tried = []
+    news = None
     for target in cfg["targets"]:
         name = "plan-%s.json" % target
         plan, err = _run(EXIT, ["plan", "--target", target, "--json", "--write", os.path.join("trader", name)] + pin,
@@ -200,7 +209,10 @@ def evaluate(sym, workdir, cfg, now=None, size=None, market=None):
             fails.append("past trades averaged %+.2fR" % cand["hist_avg_r"])
         cand["rules_ok"] = not fails
         if market:
-            cand["ml_x"] = ml.day_features(cand, market)
+            if news is None:
+                news = news_info(sym, workdir, market)
+                out["news"] = news
+            cand["ml_x"] = dict(ml.day_features(cand, market), **news_features(news))
             chk = ml.check("day", cand["ml_x"], cfg)
             cand["ml"] = chk
             if chk and not chk["pass"]:
@@ -217,22 +229,164 @@ def evaluate(sym, workdir, cfg, now=None, size=None, market=None):
     return out
 
 
-def news_check(sym, workdir, cfg):
-    """(blocked_reason or '', note) from the last 24 hours of headlines."""
-    doc, err = _run(NEWS, ["--tickers", sym, "--no-sec", "--no-moves", "--dry-run", "--hours", "24", "--json"],
-                    workdir, timeout=60)
-    if doc is None:
+# Headline wording that reads bad or good for the stock. Checked on titles only, case-insensitive.
+NEG_WORDS = re.compile(
+    r"\bdowngrade[sd]?\b|\bcuts?\b.{0,30}\b(?:target|rating|guidance|forecast|outlook|stake)\b|"
+    r"\b(?:lowers?|slashes|trims?)\b.{0,30}\b(?:target|guidance|forecast|outlook)\b|\bmiss(?:es|ed)?\b|"
+    r"\bplunge[sd]?\b|\bslump(?:s|ed)?\b|\btumble[sd]?\b|\bs[ai]nk(?:s)?\b|\bcrash(?:es|ed)?\b|\bslid(?:es?)?\b|"
+    r"\bprobe\b|\binvestigation\b|\blawsuit\b|\bsued\b|\bfraud\b|\braid(?:s|ed)?\b|\bpenalty\b|\bfined?\b|"
+    r"\brecall\b|\bbankrupt|\bdefault(?:s|ed)?\b|\binsolvency\b|\bwarns?\b|\bwarning\b|\blayoffs?\b|"
+    r"\bresign(?:s|ed)?\b|\bsteps? down\b|\bdelay(?:s|ed)?\b|\bshort[- ]seller\b|\bsell rating\b|"
+    r"\bunderperform(?:s|ed|ing)?\b|\bloss widens\b|\bprofit (?:falls|drops|declines)\b|\bweak(?:er)?\b|\bhalt(?:s|ed)?\b|"
+    r"\bpledge\b|\bblock deal\b|\bstake sale\b", re.I)
+POS_WORDS = re.compile(
+    r"\bupgrade[sd]?\b|\bbeats?\b|\btops? (?:estimates|expectations)\b|"
+    r"\b(?:raises?|hikes?|lifts?|boosts?)\b.{0,30}\b(?:target|guidance|forecast|outlook|dividend|stake)\b|"
+    r"\brecord (?:revenue|profit|sales|high|order)|\bsurge[sd]?\b|\bjump(?:s|ed)?\b|\bsoar(?:s|ed)?\b|"
+    r"\brall(?:y|ies|ied)\b|\bclimb(?:s|ed)?\b|\bgain(?:s|ed)\b|"
+    r"\bwins?\b.{0,30}\b(?:contract|order|deal|approval)\b|\bbags?\b.{0,30}\border|\bapproval\b|\bapproves?\b|"
+    r"\bbuyback\b|\boutperform(?:s|ed|ing)?\b|\bbuy rating\b|\bprofit (?:rises|jumps|grows|up)\b|\bbonus (?:issue|shares)\b|"
+    r"\bstrong(?:er)?\b", re.I)
+NEWS_TAGS_ML = ("earnings", "analyst", "legal", "deal", "risk", "people")
+SCANNER = os.path.join(SKILLS, "trader-scanner", "scan.py")
+_mods = {}
+
+
+def _module(name, path):
+    if name not in _mods:
+        spec = importlib.util.spec_from_file_location("autoscan_" + name, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _mods[name] = mod
+    return _mods[name]
+
+
+def tone(title):
+    """-1 bad, +1 good, 0 neither or both."""
+    neg, pos = bool(NEG_WORDS.search(title)), bool(POS_WORDS.search(title))
+    return (1 if pos else 0) - (1 if neg else 0)
+
+
+def company_name(sym):
+    """The company's name from Yahoo's quote data, cached in data/names.json ('' when unknown)."""
+    path = os.path.join(ml.DATA, "names.json")
+    try:
+        with open(path) as fh:
+            names = json.load(fh)
+    except (OSError, ValueError):
+        names = {}
+    if sym in names:
+        return names[sym]
+    name = ""
+    try:
+        mod = _module("scan", SCANNER)
+        meta = mod.parse_chart(mod.yahoo_get(mod.chart_path(sym, "1d", "1d")), sym).get("meta") or {}
+        name = meta.get("longName") or meta.get("shortName") or ""
+        name = re.sub(r"\s*(?:Limited|Ltd\.?|Inc\.?|Corp(?:oration)?\.?|plc)$", "", name, flags=re.I).strip(" .,")
+    except Exception:
+        return ""
+    names[sym] = name
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(names, fh, indent=1)
+    return name
+
+
+def google_news(name, hours=24, now=None):
+    """[(title, published_utc)] from Google News search for the exact company name, or None
+    when it cannot be fetched. Used for NSE stocks, where Yahoo carries few headlines."""
+    # Indian market words keep out other companies with the same name ("Eternal" vs "Eternal Beauty").
+    q = urllib.parse.quote('"%s" (share OR shares OR stock OR NSE OR BSE OR Sensex OR Nifty) when:%dd' % (
+        name, max(1, math.ceil(hours / 24.0))))
+    url = "https://news.google.com/rss/search?q=%s&hl=en-IN&gl=IN&ceid=IN:en" % q
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "breakout-signal-scanner/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            root = ET.fromstring(r.read())
+    except Exception:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    out = []
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        try:
+            when = email.utils.parsedate_to_datetime(it.findtext("pubDate") or "")
+        except (TypeError, ValueError):
+            continue
+        if title and when and now - when <= datetime.timedelta(hours=hours):
+            out.append((re.sub(r"\s+-\s+[^-]+$", "", title), when))   # drop " - Publisher"
+    return out
+
+
+def news_info(sym, workdir, market=None):
+    """The last 24 hours of headlines for sym: Yahoo Finance, plus Google News for NSE stocks.
+    {'checked': bool, 'n', 'tags': {tag: first title}, 'neg': [titles], 'pos': [titles], 'sources'}."""
+    heads, sources = [], []
+    doc, _ = _run(NEWS, ["--tickers", sym, "--no-sec", "--no-moves", "--dry-run", "--hours", "24", "--json"],
+                  workdir, timeout=60)
+    if doc is not None:
+        sources.append("Yahoo")
+        heads += [(it.get("title", ""), it.get("tags") or []) for it in doc.get("items") or []]
+    if market == "NSE" or sym.endswith(".NS"):
+        name = company_name(sym)
+        g = google_news(name) if len(name) >= 3 else None
+        if g is not None:
+            sources.append("Google News")
+            kw = _module("news", NEWS).KEYWORDS
+            # Keep headlines that name the company: the search also returns market wraps that only
+            # mention it in the text ("Sensex jumps 2,000 points...").
+            first = name.split()[0]
+            rx = re.compile(r"\b%s\b" % re.escape(first if len(first) >= 4 else name), re.I)
+            heads += [(t, [label for label, r in kw if re.search(r, t, re.I)]) for t, _ in g if rx.search(t)]
+    if not sources:
+        return {"checked": False}
+    seen, tags, neg, pos = set(), {}, [], []
+    for title, tg in heads:
+        key = re.sub(r"\W+", " ", title.lower())[:60]
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        for t in tg:
+            tags.setdefault(t, title)
+        tn = tone(title)
+        (neg if tn < 0 else pos if tn > 0 else []).append(title)
+    return {"checked": True, "n": len(seen), "tags": tags, "neg": neg, "pos": pos, "sources": sources}
+
+
+def news_features(info):
+    """The news as numbers for the day model (None when the news was not checked)."""
+    if not info or not info.get("checked"):
+        return {k: None for k in ["news_n_log", "news_neg", "news_pos"] + ["news_" + t for t in NEWS_TAGS_ML]}
+    x = {"news_n_log": math.log1p(info["n"]), "news_neg": float(len(info["neg"])), "news_pos": float(len(info["pos"]))}
+    x.update({"news_" + t: 1.0 if t in info["tags"] else 0.0 for t in NEWS_TAGS_ML})
+    return x
+
+
+def news_verdict(info, cfg):
+    """(blocked_reason or '', note for the message)."""
+    if not info or not info.get("checked"):
         return "", "❔ News could not be checked."
-    tags = {}
-    for it in doc.get("items") or []:
-        for t in it.get("tags") or []:
-            tags.setdefault(t, it.get("title", ""))
     for t in cfg["block_news_tags"]:
-        if t in tags:
-            return "news tagged %s: %s" % (t, tags[t][:100]), ""
-    if "earnings" in tags:
-        return "", "📰 Earnings news today: the price can move more than usual."
-    return "", ("📰 In the news today: %s." % ", ".join(sorted(tags))) if tags else "📰 No major news today."
+        if t in info["tags"]:
+            return "news tagged %s: %s" % (t, info["tags"][t][:100]), ""
+    neg, pos = info["neg"], info["pos"]
+    if cfg.get("block_negative_news") and len(neg) > len(pos):
+        return "bad news today: %s" % neg[0][:100], ""
+    parts = []
+    if "earnings" in info["tags"]:
+        parts.append("📰 Earnings news today: the price can move more than usual.")
+    if pos and not neg:
+        parts.append("📰 Good news today: %s" % pos[0][:120])
+    elif pos or neg:
+        parts.append("📰 Mixed news today (%d good, %d bad): %s" % (len(pos), len(neg), (neg or pos)[0][:120]))
+    elif info["tags"] and not parts:
+        parts.append("📰 In the news today: %s." % ", ".join(sorted(info["tags"])))
+    return "", "\n".join(parts) if parts else "📰 No major news today."
+
+
+def news_check(sym, workdir, cfg, market=None, info=None):
+    """(blocked_reason or '', note) from the last 24 hours of headlines."""
+    return news_verdict(info if info is not None else news_info(sym, workdir, market), cfg)
 
 
 def fmt(x):
@@ -346,7 +500,8 @@ def pick(hits, market, day_dir, cfg, now=None, log=lambda t: None):
         return r["sim_avg_r"]
     passing.sort(key=lambda r: -rank(r))
     for res in passing:
-        blocked, note = news_check(res["symbol"], os.path.join(day_dir, res["symbol"].replace("&", "_")), cfg)
+        blocked, note = news_check(res["symbol"], os.path.join(day_dir, res["symbol"].replace("&", "_")), cfg,
+                                   market, res.get("news"))
         if blocked:
             log("candidate %s dropped: %s" % (res["symbol"], blocked))
             continue

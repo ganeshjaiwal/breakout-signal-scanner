@@ -17,8 +17,10 @@
   "max_signals_per_day": 2,
   "replays": 10000,
   "block_news_tags": [
-    "halt"
+    "halt",
+    "risk"
   ],
+  "block_negative_news": true,
   "sizing": {},
   "swing": {
     "enabled": true,

@@ -115,8 +115,12 @@ through these steps:
    risk (the distance from entry to stop).
 3. **Time machine:** each plan is replayed 10,000 times using the stock's own 5-minute
    moves from the last 60 days, and checked against every past day the same rule fired.
-4. **News:** Yahoo headlines from the last 24 hours. A trading halt blocks the signal;
-   earnings news is mentioned in the message.
+4. **News:** headlines from the last 24 hours: Yahoo Finance, plus Google News for NSE
+   stocks (only headlines that name the company). Each headline is read as good, bad or
+   neither from its wording (downgrade, cuts target, misses, probe... vs upgrade, beats,
+   raises guidance, wins order...). The signal is blocked by a trading halt, a "risk"
+   headline (recall, bankruptcy, default, breach...), or more bad headlines than good ones.
+   Otherwise the message says what it found. Swing picks get the same check.
 
 A signal is sent only if **all** of these hold (defaults, all adjustable):
 
@@ -161,7 +165,8 @@ has proven itself, also has to pass a signal before it goes to Telegram. It runs
    saved day-trade candidate against that day's 5-minute bars: target, stop or time limit,
    and the result in R (`data/ml/day.jsonl`).
 3. **Train.** When the data changed, it retrains a logistic regression in plain Python
-   (no extra packages). It waits for enough data first: day trades 600 rows over 25 trading
+   (no extra packages). Day trades also use the news: how many headlines, how many read good
+   or bad, and which tags. It waits for enough data first: day trades 600 rows over 25 trading
    days with 80 target hits; swing 3,000 rows over 250 days with 400 target hits.
 4. **Test.** It holds out the newest 25% of trading days. The model scores each trade as an
    expected result in R. It is switched on only if, on those held-out days, the trades it
@@ -318,6 +323,8 @@ discount-broker rates.
 | `min_sim_avg_r` | `0.10` | day trades: minimum average replay result, in units of risk |
 | `min_history_trades` | `12` | day trades: minimum past trades of the same rule on the stock |
 | `max_signals_per_day` | `2` | day trades, per market |
+| `block_news_tags` | `["halt", "risk"]` | news tags that block a signal (also: earnings, analyst, legal, deal, capital, people, regulatory, macro) |
+| `block_negative_news` | `true` | block when the day's headlines read more bad than good |
 | `swing.enabled` | `true` | turn swing signals on or off |
 | `swing.hold_days` | `10` | swing time exit, in trading days |
 | `swing.min_confidence_pct` | `30` | swing: minimum blended target hit rate |
@@ -382,7 +389,8 @@ scan results, signal records), `autoscan/cron.log` and `autoscan/update.log`.
 
 - **Prices:** Yahoo Finance's free chart endpoints. Unofficial, can lag by a few minutes,
   and can rate-limit busy or cloud IP addresses. Not for high-frequency use.
-- **News:** Yahoo Finance headlines. SEC filings are checked for US companies only.
+- **News:** Yahoo Finance headlines, plus Google News for NSE stocks. The good/bad reading
+  is a word list, not a full understanding of the article. SEC filings are not checked.
 - **Calendars:** NYSE holidays and early closes for 2026–2027, NSE holidays for 2026.
   Add the NSE 2027 list to `NSE_HOLIDAYS` in the skill scripts when NSE publishes it.
 - **Not modelled:** your broker's real fills, slippage and exact charges; circuit limits;

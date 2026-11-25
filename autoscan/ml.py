@@ -61,7 +61,8 @@ DEFAULTS = {
 
 DAY_FEATURES = ["p_target", "p_stop", "sim_avg_r", "hist_n_log", "hist_hit", "hist_stop", "hist_green",
                 "hist_avg_r", "target_r", "risk_pct", "chase_r", "age_min", "volume_x", "pct_over",
-                "mins_open", "is_us"]
+                "mins_open", "is_us", "news_n_log", "news_neg", "news_pos", "news_earnings", "news_analyst",
+                "news_legal", "news_deal", "news_risk", "news_people"]
 SWING_SETUPS = ("breakout_20d", "bull_flag", "reclaim_ma20", "oversold_bounce")
 SWING_FEATURES = ["setup_" + s for s in SWING_SETUPS] + [
     "k", "atr_pct", "ret5", "ret20", "dist_hi20", "dist_ma50", "ma20_slope", "rsi", "day_range_atr",

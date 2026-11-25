@@ -303,7 +303,7 @@ def sessions_after(mod, day, n):
     return out
 
 
-def message(market, label, shown, s, hold, mod=None):
+def message(market, label, shown, s, hold, mod=None, note=None):
     P = lambda x: signals.price(market, x)  # noqa: E731
     title = "🌱 SWING BUY: %s  %s %s · hold up to %d days" % (shown, signals.FLAG.get(market, ""), market, hold)
     risk = s["close"] - s["stop"]
@@ -327,6 +327,7 @@ def message(market, label, shown, s, hold, mod=None):
         "",
         "⏰ If neither price is hit, sell at the close on %s." % (last or "the %dth trading day" % hold),
         "💡 Why: %s." % PLAIN[s["setup"]],
+    ] + ([note] if note else []) + [
         "📜 Last %.0f years, %d similar trades: ✅ %d hit the target, ❌ %d hit the stop, ⏳ %d ran out of time." % (
             s["years"], s["n"], s["target_n"], s["stop_n"], s["time_n"]),
         "🌙 The price can open below the stop overnight, so a loss can be bigger.",

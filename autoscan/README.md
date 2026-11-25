@@ -35,7 +35,8 @@ every check in `signal_config.json` is sent, at most one per scan and 2 per mark
 - confidence (replays where the target came before the stop and the flat-by time) at least 35%
 - replay average at least +0.10R, and the rule's real average over the last 60 days not negative
   over at least 12 trades
-- no trading-halt news
+- no trading-halt or "risk" news, and not more bad headlines than good (Yahoo, plus Google
+  News for NSE stocks); swing picks get the same check
 
 The message gives the buy range, sell range, stop loss and confidence. Confidence is a
 number from replays of past prices, not a promise: signals will lose sometimes. The
