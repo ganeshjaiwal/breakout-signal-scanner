@@ -22,6 +22,7 @@ import datetime
 import json
 import os
 
+import ml
 import signals
 
 SETUPS = ("breakout_20d", "bull_flag", "reclaim_ma20", "oversold_bounce")
@@ -131,9 +132,10 @@ def walk(bars, i, lv, hold):
             "entry": entry}
 
 
-def backtest(mod, bars, sc):
+def backtest(mod, bars, sc, rows=None, sym=None, market=None):
     """{(setup, k): [R, ...] with outcomes} over every past signal day of this stock, one trade
-    at a time per setup and target (a new signal while one is open is ignored)."""
+    at a time per setup and target (a new signal while one is open is ignored).
+    rows: a list to append one learning row per trade to (ml.py), features as of the signal day."""
     closes = [b["c"] for b in bars]
     atr = atr_series(bars, sc["atr_days"])
     res = {(s, k): {"R": [], "target": 0, "stop": 0, "time": 0} for s in SETUPS for k in sc["targets_r"]}
@@ -152,6 +154,14 @@ def backtest(mod, bars, sc):
                 t = walk(bars, i, levels(closes[i], atr[i], k, sc), sc["hold_days"])
                 if not t or t["outcome"] in ("no_entry", "open"):
                     continue
+                if rows is not None:
+                    r = res[key]
+                    x = ml.swing_features(ml.swing_base(mod, bars, closes, atr, i), s, k, len(r["R"]), sum(r["R"]),
+                                          r["target"], market)
+                    rows.append({"id": "%s|%s|%s|%g" % (sym, bars[i]["d"].isoformat(), s, k), "market": market,
+                                 "date": bars[i]["d"].isoformat(), "symbol": sym, "x": ml._round(x),
+                                 "y": 1 if t["outcome"] == "target" else 0, "R": round(t["R"], 3),
+                                 "outcome": t["outcome"]})
                 busy[key] = t["exit_i"]
                 res[key]["R"].append(t["R"])
                 res[key][t["outcome"]] += 1
@@ -165,8 +175,9 @@ def stats(r):
             "green": (sum(1 for x in r["R"] if x > 0) / n) if n else 0.0}
 
 
-def scan(mod, symbols, sc, now_utc, log=lambda t: None):
-    """Backtest every symbol, then list today's candidates. Returns (candidates, pool, as_of, failed)."""
+def scan(mod, symbols, sc, now_utc, log=lambda t: None, market=None, rows=None):
+    """Backtest every symbol, then list today's candidates. Returns (candidates, pool, as_of, failed).
+    rows: a list to collect the backtest's learning rows into (see backtest)."""
     pool = {}
     live = []
     failed = 0
@@ -180,27 +191,30 @@ def scan(mod, symbols, sc, now_utc, log=lambda t: None):
         if len(bars) < 250:
             failed += 1
             continue
-        bt = backtest(mod, bars, sc)
+        bt = backtest(mod, bars, sc, rows, sym, market)
         for key, r in bt.items():
             p = pool.setdefault(key, {"R": [], "target": 0, "stop": 0, "time": 0})
             p["R"] += r["R"]
             for o in ("target", "stop", "time"):
                 p[o] += r[o]
         closes = [b["c"] for b in bars]
-        atr = atr_series(bars, sc["atr_days"])[-1]
+        atrs = atr_series(bars, sc["atr_days"])
+        atr = atrs[-1]
         dates[bars[-1]["d"]] = dates.get(bars[-1]["d"], 0) + 1
         tags, _ = mod.find_setups(closes[-WINDOW:])
         for s in tags:
             if s in SETUPS and atr:
                 live.append({"symbol": sym, "setup": s, "close": closes[-1], "atr": atr, "date": bars[-1]["d"],
+                             "ml_base": ml.swing_base(mod, bars, closes, atrs, len(bars) - 1),
                              "bt": {k: stats(bt[(s, k)]) for k in sc["targets_r"]}, "years": len(bars) / 252.0})
     as_of = max(dates, key=lambda d: (dates[d], d)) if dates else None
     live = [c for c in live if c["date"] == as_of]
     return live, {k: stats(v) for k, v in pool.items()}, as_of, failed
 
 
-def choose(live, pool, sc, size, skip=(), log=lambda t: None):
-    """The passing candidates, best first. Each is one (symbol, setup, target) plan."""
+def choose(live, pool, sc, size, skip=(), log=lambda t: None, cfg=None, market=None):
+    """The passing candidates, best first. Each is one (symbol, setup, target) plan.
+    cfg and market turn on the learned check (ml.py)."""
     out = []
     for c in live:
         if c["symbol"] in skip:
@@ -223,12 +237,24 @@ def choose(live, pool, sc, size, skip=(), log=lambda t: None):
                     fails.append("confidence %.0f%% < %s%%" % (st["conf"] * 100, sc["min_confidence_pct"]))
             if pl["avg_r"] < sc["min_pool_avg_r"]:
                 fails.append("whole-list average %+.2fR" % pl["avg_r"])
+            chk = None
+            if cfg is not None and market and c.get("ml_base"):
+                x = ml.swing_features(c["ml_base"], c["setup"], k, raw["n"], raw["avg_r"] * raw["n"], raw["target_n"],
+                                      market)
+                chk = ml.check("swing", x, cfg)
+                if chk:
+                    log("swing %s %s %gR: AI %.0f%% target first, %+.2fR expected (needs %+.2fR, %s)" % (
+                        c["symbol"], c["setup"], k, chk["p"] * 100, chk["ev"], chk["threshold"],
+                        "live" if ml.active(chk) else "watching only"))
+                if not fails and chk and not chk["pass"]:
+                    fails.append("AI model %+.2fR < %+.2fR" % (chk["ev"], chk["threshold"]))
             if fails:
                 why = why or "%gR: %s" % (k, "; ".join(fails))
                 continue
             if best is None or st["avg_r"] > best["avg_r"]:
                 lv = levels(c["close"], c["atr"], k, sc)
-                best = dict(st, k=k, pool_avg_r=pl["avg_r"], pool_n=pl["n"], **{x: round(v, 2) for x, v in lv.items()})
+                best = dict(st, k=k, pool_avg_r=pl["avg_r"], pool_n=pl["n"], ml=chk,
+                            **{x: round(v, 2) for x, v in lv.items()})
         if best is None:
             log("swing %s %s: %s" % (c["symbol"], c["setup"], why))
             continue
@@ -244,7 +270,11 @@ def choose(live, pool, sc, size, skip=(), log=lambda t: None):
         out.append({"symbol": c["symbol"], "setup": c["setup"], "date": c["date"].isoformat(),
                     "close": round(c["close"], 2), "atr": round(c["atr"], 2), "years": round(c["years"], 1),
                     "position": pos, **best})
-    out.sort(key=lambda x: -x["avg_r"])
+    def rank(x):
+        if ml.active(x.get("ml")):   # the learned odds, as an expected result in R
+            return x["ml"]["ev"]
+        return x["avg_r"]
+    out.sort(key=lambda x: -rank(x))
     return out
 
 
@@ -289,6 +319,7 @@ def message(market, label, shown, s, hold, mod=None):
         "🛑 Stop loss: %s" % P(s["stop"]),
         "📊 Confidence: %.0f%%" % (s["conf"] * 100),
     ]
+    body += signals.ai_lines(s.get("ml"))
     pos = signals.position_lines(market, s.get("position"), delivery=True)
     if pos:
         body += [""] + pos

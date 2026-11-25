@@ -19,6 +19,9 @@ markets on their own clock:
 Weekends and exchange holidays (NSE 2026, NYSE 2026-2027) are skipped. NSE has not
 published its 2027 holiday list yet: add it to the scanner's `NSE_HOLIDAYS` when it does.
 
+After the close each market also runs `swing` (NSE 16:30 IST, US 17:00 ET) and `learn`
+(NSE 17:05 IST, US 17:35 ET: labels the day's candidates and retrains the AI check, see `ml.py`).
+
 By default only trade signals and one end-of-day report per market are sent.
 
 ## Trade signals (the only alerts by default)
@@ -78,6 +81,8 @@ python3 autoscan.py tick --dry-run --now "2026-11-13 20:30"  # what would run at
 python3 autoscan.py run --market NSE --mode orb           # one scan now
 python3 autoscan.py summary                               # today's hits
 python3 autoscan.py test-notify
+python3 autoscan.py ml status                             # AI check: data collected, latest test
+python3 autoscan.py ml learn                              # label and retrain now
 ```
 
 ## Files
@@ -88,6 +93,9 @@ python3 autoscan.py test-notify
 - `data/<market>/log/DATE.log`: what each run did
 - `data/<market>/state-DATE.json`: runs, hits, what was already notified
 - `data/<market>/results/DATE/HHMM-mode.json`: full scanner output
+- `data/<market>/signals/DATE/tried.jsonl`: every scored day-trade candidate, for learning
+- `data/ml/`: learning rows (`day.jsonl`, `swing-<market>.jsonl.gz`), models
+  (`model-day.json`, `model-swing.json`) and every training's test result (`history.jsonl`)
 - `cron.log`: cron's own output (errors land here)
 
 

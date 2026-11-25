@@ -20,6 +20,9 @@ import json
 import os
 import subprocess
 import sys
+from zoneinfo import ZoneInfo
+
+import ml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILLS = os.path.join(HERE, "..", "day-trader-skill", "skills")
@@ -49,6 +52,7 @@ DEFAULTS = {
     # A market with no entry gets no quantity line. Amounts are in the stock's own currency.
     "sizing": {},
     "swing": {},                  # swing-signal settings, see swing.py DEFAULTS
+    "ml": {},                     # the learned signal check, see ml.py DEFAULTS
 }
 
 
@@ -118,7 +122,10 @@ def _run(script, args, cwd, timeout=120):
         return None, lines[-1][:200]
 
 
-def evaluate(sym, workdir, cfg, now=None, size=None):
+TZ = {"NSE": ZoneInfo("Asia/Kolkata"), "US": ZoneInfo("America/New_York")}
+
+
+def evaluate(sym, workdir, cfg, now=None, size=None, market=None):
     """Run entry -> exit -> time machine for one symbol.
     Returns {"symbol", "ok": bool, "why": str, ...plan and odds when ok}."""
     os.makedirs(os.path.join(workdir, "trader"), exist_ok=True)
@@ -191,6 +198,13 @@ def evaluate(sym, workdir, cfg, now=None, size=None):
             fails.append("only %d past trades" % cand["hist_trades"])
         elif cand["hist_avg_r"] < cfg["min_history_avg_r"]:
             fails.append("past trades averaged %+.2fR" % cand["hist_avg_r"])
+        cand["rules_ok"] = not fails
+        if market:
+            cand["ml_x"] = ml.day_features(cand, market)
+            chk = ml.check("day", cand["ml_x"], cfg)
+            cand["ml"] = chk
+            if chk and not chk["pass"]:
+                fails.append("AI model %+.2fR < %+.2fR" % (chk["ev"], chk["threshold"]))
         cand["fails"] = fails
         if not fails and (best is None or cand["sim_avg_r"] > best["sim_avg_r"]):
             best = cand
@@ -257,6 +271,13 @@ def position_lines(market, p, delivery=False):
     return out
 
 
+def ai_lines(chk):
+    if not ml.active(chk):
+        return []
+    return ["🤖 AI check: %.0f%% target first, expected %+.2fR (passes at %+.2fR, model v%s)" % (
+        chk["p"] * 100, chk["ev"], chk["threshold"], chk["version"])]
+
+
 def message(market, label, sym_shown, s, note):
     """(title, body) for one day-trade signal: short, plain words, emojis for scanning."""
     title = "🟢 BUY NOW: %s  %s %s · day trade" % (sym_shown, FLAG.get(market, ""), market)
@@ -267,6 +288,7 @@ def message(market, label, sym_shown, s, note):
         "🛑 Stop loss: %s" % price(market, s["stop"]),
         "📊 Confidence: %.0f%%" % (s["p_target"] * 100),
     ]
+    body += ai_lines(s.get("ml"))
     pos = position_lines(market, s.get("position"))
     if pos:
         body += [""] + pos
@@ -291,17 +313,38 @@ def pick(hits, market, day_dir, cfg, now=None, log=lambda t: None):
     and writes every candidate's result to day_dir/candidates.jsonl."""
     passing = []
     os.makedirs(day_dir, exist_ok=True)
+    learn = ml.config(cfg)["mode"] != "off"
     for h in hits[:cfg["max_candidates_per_scan"]]:
         sym = h["symbol"]
-        res = evaluate(sym, os.path.join(day_dir, sym.replace("&", "_")), cfg, now, (cfg.get("sizing") or {}).get(market))
-        res["checked_at"] = now or datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        res = evaluate(sym, os.path.join(day_dir, sym.replace("&", "_")), cfg, now, (cfg.get("sizing") or {}).get(market),
+                       market=market if learn else None)
+        local = datetime.datetime.strptime(now, "%Y-%m-%d %H:%M") if now else \
+            datetime.datetime.now(TZ.get(market, TZ["US"])).replace(tzinfo=None)
+        res["checked_at"] = local.strftime("%Y-%m-%d %H:%M")
+        bar_after = "%02d:%02d" % (local.hour, local.minute - local.minute % 5)
         with open(os.path.join(day_dir, "candidates.jsonl"), "a") as fh:
-            fh.write(json.dumps({k: v for k, v in res.items() if k != "tried"}) + "\n")
+            fh.write(json.dumps({k: v for k, v in res.items() if k not in ("tried", "ml_x")}) + "\n")
+        if learn:
+            # Every target the time machine scored, passed or not: the rows the day model learns from.
+            with open(os.path.join(day_dir, "tried.jsonl"), "a") as fh:
+                for c in res.get("tried", []):
+                    if "ml_x" not in c:
+                        continue
+                    fh.write(json.dumps({
+                        "id": "%s|%s|%s|%g" % (market, res["checked_at"], sym, c["target_r"]), "symbol": sym,
+                        "checked_at": res["checked_at"], "bar_after": bar_after, "x": c["ml_x"],
+                        "rules_ok": c["rules_ok"], "p_model": (c.get("ml") or {}).get("p"),
+                        **{k: c[k] for k in ("entry", "stop", "target", "target_r", "risk", "flat_by")}}) + "\n")
         log("candidate %s: %s" % (sym, "PASS %.0f%% %+.2fR at %gR" % (res["p_target"] * 100, res["sim_avg_r"],
                                                                        res["target_r"]) if res["ok"] else res["why"]))
         if res["ok"]:
             passing.append(res)
-    passing.sort(key=lambda r: -r["sim_avg_r"])
+    def rank(r):
+        chk = r.get("ml")
+        if ml.active(chk):   # the learned odds, as an expected result in R
+            return chk["ev"]
+        return r["sim_avg_r"]
+    passing.sort(key=lambda r: -rank(r))
     for res in passing:
         blocked, note = news_check(res["symbol"], os.path.join(day_dir, res["symbol"].replace("&", "_")), cfg)
         if blocked:
@@ -312,14 +355,16 @@ def pick(hits, market, day_dir, cfg, now=None, log=lambda t: None):
     return None
 
 
-def outcome(mod, sig, day, now_utc):
-    """How a sent signal ended, from the day's 5-minute bars: ('target'|'stop'|'flat'|'open'|'unknown', R)."""
-    try:
-        series = mod.parse_chart(mod.yahoo_get(mod.chart_path(sig["symbol"], "1d", "5m")), sig["symbol"])
-        cutoff = mod.to_eastern(now_utc)
-        bars = mod.session_bars(series, day, cutoff)
-    except Exception:
-        return "unknown", None
+def outcome(mod, sig, day, now_utc, bars=None):
+    """How a sent signal ended, from the day's 5-minute bars: ('target'|'stop'|'flat'|'open'|'unknown', R).
+    bars: that day's session bars when the caller already has them."""
+    cutoff = mod.to_eastern(now_utc)
+    if bars is None:
+        try:
+            series = mod.parse_chart(mod.yahoo_get(mod.chart_path(sig["symbol"], "1d", "5m")), sig["symbol"])
+            bars = mod.session_bars(series, day, cutoff)
+        except Exception:
+            return "unknown", None
     hh, mm = [int(x) for x in sig["flat_by"].split(":")]
     flat = datetime.time(hh, mm)
     after = [b for b in bars if b["start"].strftime("%H:%M") >= sig["bar_after"]]

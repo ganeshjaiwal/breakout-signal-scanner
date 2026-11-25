@@ -149,6 +149,37 @@ signal per market per day, and none while three swing trades are open.
 real results will usually be somewhat worse. Treat it as "how often this worked before",
 not "the chance it works now".
 
+### AI check (learns from how signals ended)
+
+`autoscan/ml.py` learns which signals tend to reach the target before the stop and, once it
+has proven itself, also has to pass a signal before it goes to Telegram. It runs on its own:
+
+1. **Collect.** Every day-trade candidate the time machine scores is saved, sent or not,
+   with each target it tried (`data/<market>/signals/<day>/tried.jsonl`). Every swing run
+   also saves each trade of its 5-year backtest (`data/ml/swing-<market>.jsonl.gz`).
+2. **Label.** The daily `learn` step (NSE 17:05 IST, US 17:35 New York time) checks each
+   saved day-trade candidate against that day's 5-minute bars: target, stop or time limit,
+   and the result in R (`data/ml/day.jsonl`).
+3. **Train.** When the data changed, it retrains a logistic regression in plain Python
+   (no extra packages). It waits for enough data first: day trades 600 rows over 25 trading
+   days with 80 target hits; swing 3,000 rows over 250 days with 400 target hits.
+4. **Test.** It holds out the newest 25% of trading days. The model scores each trade as an
+   expected result in R. It is switched on only if, on those held-out days, the trades it
+   would keep beat all of them by at least +0.05R on average, stay positive, rank well
+   (AUC ≥ 0.55) and number at least 30. For day trades it must also not do worse than the
+   rules alone on the signals the rules pass.
+5. **Use.** Until it passes, it only watches (scores are logged, nothing is blocked). Once
+   it passes you get a 🤖 message on Telegram, and from then on a signal must pass the usual
+   rules **and** the model, ranked by the model's expected R, with a 🤖 line in the message.
+   It is re-tested on every retrain: if it stops passing, it switches off and tells you.
+
+`python3 autoscan/autoscan.py ml status` shows how much data each model has and its latest
+test. `ml learn` labels and retrains now. `"ml": {"mode": "shadow"}` keeps it watching only,
+`"off"` stops it. The other thresholds are in `DEFAULTS` in `autoscan/ml.py`.
+
+**About the AI check:** it learns from past prices and is tested on past prices it did not
+train on. That is better than in-sample, but markets change. It can still be wrong.
+
 ## Requirements
 
 - **Python 3.9 or newer.** Standard library only: there is nothing to `pip install`.
@@ -292,9 +323,11 @@ discount-broker rates.
 | `swing.min_confidence_pct` | `30` | swing: minimum blended target hit rate |
 | `swing.min_avg_r` | `0.15` | swing: minimum blended average result |
 | `swing.max_open` | `3` | swing: no new signal while this many are open |
+| `ml.mode` | `"auto"` | AI check: `"auto"` blocks only once the model passes its test, `"shadow"` never blocks, `"off"` |
 
 Every key, with a comment, is in `DEFAULTS` at the top of
-[autoscan/signals.py](autoscan/signals.py) and [autoscan/swing.py](autoscan/swing.py).
+[autoscan/signals.py](autoscan/signals.py), [autoscan/swing.py](autoscan/swing.py) and
+[autoscan/ml.py](autoscan/ml.py).
 
 ### Stock lists
 

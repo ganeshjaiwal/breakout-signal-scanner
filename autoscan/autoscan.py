@@ -7,6 +7,9 @@ their own clock and runs, per market:
   daily  once before the open    NSE 08:45-09:05 IST   US 09:00-09:15 New York
   orb    in the entry window     NSE 09:45-14:50 IST   US 10:00-15:30 New York
   report once after the close    NSE 15:45-16:15 IST   US 16:15-16:45 New York
+  swing  once after the report   NSE 16:30-17:00 IST   US 17:00-17:30 New York
+  learn  once after the swing    NSE 17:05-17:30 IST   US 17:35-18:00 New York
+         (label today's candidates with how they ended, retrain the models: ml.py)
 
 Weekends and exchange holidays are skipped (the scanner's own calendars).
 New hits are sent once each, as a desktop notification and/or a Telegram
@@ -20,6 +23,8 @@ Usage:
   autoscan.py summary [--date YYYY-MM-DD]   # today's hits, both markets
   autoscan.py report --market NSE [--date]  # send the end-of-day report now
   autoscan.py test-notify                   # send a test notification
+  autoscan.py ml status                     # the learned models: data collected, test results
+  autoscan.py ml learn [--market NSE]       # label and retrain now
 """
 import argparse
 import datetime
@@ -34,6 +39,7 @@ import urllib.request
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ml  # noqa: E402
 import signals  # noqa: E402
 import swing  # noqa: E402
 
@@ -47,11 +53,12 @@ NO_NOTIFY = False
 MARKETS = {
     "NSE": {"tz": ZoneInfo("Asia/Kolkata"), "label": "IST", "list": "lists/nifty50.txt", "suffix": ".NS",
             "daily": ("08:45", "09:05"), "orb": ("09:35", "14:50"), "report": ("15:45", "16:15"), "swing": ("16:30", "17:00"),
-            "name": "NIFTY 50"},
+            "learn": ("17:05", "17:30"), "name": "NIFTY 50"},
     "US": {"tz": ZoneInfo("America/New_York"), "label": "ET", "list": "lists/us.txt", "suffix": "",
            "daily": ("09:00", "09:15"), "orb": ("09:50", "15:30"), "report": ("16:15", "16:45"), "swing": ("17:00", "17:30"),
-           "name": "US (NDX 100 + S&P 100)"},
+           "learn": ("17:35", "18:00"), "name": "US (NDX 100 + S&P 100)"},
 }
+MODES = ("daily", "orb", "report", "swing", "learn")
 SETUP_LABEL = {"breakout_20d": "20-day closing high", "bull_flag": "bull flag", "reclaim_ma20": "reclaimed 20-day avg",
                "oversold": "oversold (RSI<30)", "oversold_bounce": "oversold bounce", "orb": "opening-range breakout"}
 
@@ -220,6 +227,10 @@ def do_scan(market, mode, day, force=False):
         if not st.get("swing_done") or force:
             run_swing(market, day)
         return
+    if mode == "learn":
+        if not st.get("learn_done") or force:
+            run_learn(market, day)
+        return
     if mode == "report":
         if (not st.get("report_done") and signals.load_config()["eod_report"]) or force:
             send_report(market, day)
@@ -303,13 +314,18 @@ def run_swing(market, day, dry=False):
             sent = notify(title, body)
             log(market, day, "swing closed %s: %s %+.2fR, sent: %s" % (show(p["symbol"]), p["outcome"], p["R"],
                                                                       ", ".join(sent) or "nowhere"))
-    live, pool, as_of, failed = swing.scan(mod, symbols(market), sc, now, say)
+    rows = [] if ml.config(cfg)["mode"] != "off" else None
+    live, pool, as_of, failed = swing.scan(mod, symbols(market), sc, now, say, market=market, rows=rows)
+    if rows:
+        ml.write_swing_rows(market, rows)
+        say("learn: %d past swing trades saved for training" % len(rows))
     say("swing: %d setups on the %s close; %d of %d charts failed or too short" % (
         len(live), as_of, failed, len(symbols(market))))
     picks = []
     if len(still) < sc["max_open"]:
         picks = swing.choose(live, pool, sc, (cfg.get("sizing") or {}).get(market),
-                             skip={p["symbol"] for p in still}, log=say)[:sc["max_signals_per_day"]]
+                             skip={p["symbol"] for p in still}, log=say, cfg=cfg,
+                             market=market)[:sc["max_signals_per_day"]]
         picks = picks[:max(0, sc["max_open"] - len(still))]
     else:
         say("swing: %d trades already open (limit %d), no new signal" % (len(still), sc["max_open"]))
@@ -333,6 +349,45 @@ def run_swing(market, day, dry=False):
     st = load_state(market, day)
     st["swing_done"] = True
     save_state(market, day, st)
+
+
+def run_learn(market, day, send=True, say=None):
+    """Label this market's day-trade candidates with how they ended, then retrain every model
+    whose data changed. Tells you on Telegram when a model starts or stops checking signals."""
+    cfg = signals.load_config()
+    say = say or (lambda t: log(market, day, t))
+    if ml.config(cfg)["mode"] != "off":
+        mod = load_scanner()
+        mod.use_market("NSE" if market == "NSE" else "NYSE")
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        os.makedirs(ml.ML_DIR, exist_ok=True)
+        with open(os.path.join(ml.ML_DIR, ".lock"), "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            ml.label_days(mod, market, os.path.join(market_dir(market), "signals"),
+                          lambda t, d, n, bars: signals.outcome(mod, t, d, n, bars), now, log=say)
+            for kind, st, changed in ml.learn(cfg, log=say):
+                if not changed or not send:
+                    continue
+                name = {"day": "day-trade", "swing": "swing"}[kind]
+                if st["ready"]:
+                    mt = st["metrics"]
+                    title = "🤖 AI check is now ON for %s signals" % name
+                    body = ("It learned from %d past trades and passed its test on the newest %d.\n"
+                            "On those, the trades it would keep averaged %+.2fR vs %+.2fR for all of them.\n"
+                            "From now on a %s signal is sent only if the model also expects %+.2fR or more.\n\n"
+                            "⚠️ Learned from past prices. Not a promise or advice." % (
+                                mt["train_rows"], mt["test_rows"], mt["test_avg_r_kept"], mt["test_avg_r_all"], name,
+                                st["threshold"]))
+                else:
+                    title = "🤖 AI check is now OFF for %s signals" % name
+                    body = ("Its latest test on the newest trades did not pass (%s).\n"
+                            "Signals go out on the usual rules alone while it keeps learning." % st["status"])
+                sent = notify(title, body)
+                say("learn: %s, sent: %s" % (title, ", ".join(sent) or "nowhere"))
+    if send:
+        st = load_state(market, day)
+        st["learn_done"] = True
+        save_state(market, day, st)
 
 
 def report_text(market, day):
@@ -427,7 +482,7 @@ def due(market, now_local):
     """The mode this market should run at now_local, or None."""
     m = MARKETS[market]
     t = now_local.time()
-    for mode in ("daily", "orb", "report", "swing"):
+    for mode in MODES:
         a, b = m[mode]
         if hhmm(a) <= t <= hhmm(b):
             return mode
@@ -501,11 +556,11 @@ def cmd_next(a):
                     closed[local.date()] = trading_day(market, local.date())[0]
                 if closed[local.date()]:
                     found[mode] = local
-            if len(found) == 4:
+            if len(found) == len(MODES):
                 break
             t += datetime.timedelta(minutes=5)
         print("%s:" % m["name"])
-        for mode in ("daily", "orb", "report", "swing"):
+        for mode in MODES:
             if mode in found:
                 print("  next %-6s %s (%s here)" % (mode, found[mode].strftime("%a %Y-%m-%d %H:%M ") + m["label"],
                                                    found[mode].astimezone().strftime("%H:%M %Z")))
@@ -562,6 +617,17 @@ def cmd_summary(a):
     return 0
 
 
+def cmd_ml(a):
+    cfg = signals.load_config()
+    if a.action == "learn":
+        markets = [a.market.upper()] if a.market else list(MARKETS)
+        for market in markets:
+            day = datetime.datetime.now(MARKETS[market]["tz"]).date()
+            run_learn(market, day, send=False, say=print)
+    print(ml.status_text(cfg))
+    return 0
+
+
 def cmd_test(a):
     sent = notify("Day trader autoscan", "Test notification. Telegram is %s." %
                   ("set up" if telegram_conf() else "not set up (no %s)" % TELEGRAM_ENV))
@@ -601,6 +667,10 @@ def main():
     p = sub.add_parser("summary")
     p.add_argument("--date")
     p.set_defaults(fn=cmd_summary)
+    p = sub.add_parser("ml", help="the learned signal check: status, or label and retrain now")
+    p.add_argument("action", choices=["status", "learn"])
+    p.add_argument("--market", choices=["NSE", "US", "nse", "us"])
+    p.set_defaults(fn=cmd_ml)
     p = sub.add_parser("test-notify")
     p.set_defaults(fn=cmd_test)
     a = ap.parse_args()
