@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automatic scans for NIFTY 50 (NSE) and US stocks, inside each market's trade window.
+"""Automatic scans for NIFTY 50 (NSE), US stocks and forex, inside each market's trade window.
 
 cron runs `autoscan.py tick` every 15 minutes. Each tick checks both markets on
 their own clock and runs, per market:
@@ -10,6 +10,12 @@ their own clock and runs, per market:
   swing  once after the report   NSE 16:30-17:00 IST   US 17:00-17:30 New York
   learn  once after the swing    NSE 17:05-17:30 IST   US 17:35-18:00 New York
          (label today's candidates with how they ended, retrain the models: ml.py)
+
+Forex (FX, the pairs in lists/forex.txt, London time; forex.py does the checks):
+  orb    every 5 minutes 08:15-14:45 London   London-open breakouts, BUY or SELL
+  report once 16:00-16:30 London
+  swing  once 01:15-01:45 London, on the day's completed daily bar (UTC day)
+  No pre-market scan and no learned (AI) check for forex.
 
 Weekends and exchange holidays are skipped (the scanner's own calendars).
 New hits are sent once each, as a desktop notification and/or a Telegram
@@ -39,6 +45,7 @@ import urllib.request
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import forex  # noqa: E402
 import ml  # noqa: E402
 import signals  # noqa: E402
 import swing  # noqa: E402
@@ -57,8 +64,16 @@ MARKETS = {
     "US": {"tz": ZoneInfo("America/New_York"), "label": "ET", "list": "lists/us.txt", "suffix": "",
            "daily": ("09:00", "09:15"), "orb": ("09:50", "15:30"), "report": ("16:15", "16:45"), "swing": ("17:00", "17:30"),
            "learn": ("17:35", "18:00"), "name": "US (NDX 100 + S&P 100)"},
+    # Forex: no daily or learn step. The swing run waits for UTC midnight (01:15 London is
+    # 00:15 or 01:15 UTC), when Yahoo's daily forex bar for the day before is complete.
+    # "history" downloads past sessions from Dukascopy a few minutes per tick in the evening.
+    "FX": {"tz": forex.LONDON, "label": "London", "list": "lists/forex.txt", "suffix": "=X",
+           "orb": ("08:15", "14:45"), "report": ("16:00", "16:30"), "history": ("17:00", "23:30"),
+           "swing": ("01:15", "01:45"), "name": "Forex"},
 }
-MODES = ("daily", "orb", "report", "swing", "learn")
+MODES = ("daily", "orb", "report", "history", "swing", "learn")
+FX_HISTORY_BUDGET_S = 200   # per tick, under cron's 5 minutes
+FX_HISTORY_PAUSE_MIN = 30   # after the feed stops answering
 SETUP_LABEL = {"breakout_20d": "20-day closing high", "bull_flag": "bull flag", "reclaim_ma20": "reclaimed 20-day avg",
                "oversold": "oversold (RSI<30)", "oversold_bounce": "oversold bounce", "orb": "opening-range breakout"}
 
@@ -76,7 +91,9 @@ def load_scanner():
 
 
 def trading_day(market, day):
-    """(ok, reason) from the scanner's own NYSE / NSE calendar."""
+    """(ok, reason) from the scanner's own NYSE / NSE calendar, or forex's (weekdays)."""
+    if market == "FX":
+        return forex.trading_day(day)
     mod = load_scanner()
     mod.use_market("NSE" if market == "NSE" else "NYSE")
     return mod.trading_day(day)
@@ -215,6 +232,8 @@ def run_scan(market, mode, day):
 
 
 def show(sym):
+    if sym.endswith("=X"):
+        return forex.shown(sym)
     return sym[:-3] if sym.endswith(".NS") else sym
 
 
@@ -234,6 +253,12 @@ def do_scan(market, mode, day, force=False):
     if mode == "report":
         if (not st.get("report_done") and signals.load_config()["eod_report"]) or force:
             send_report(market, day)
+        return
+    if market == "FX":
+        if mode == "orb":
+            fx_orb(day)
+        elif mode == "history":
+            fx_history(day)
         return
     doc, msg = run_scan(market, mode, day)
     if doc is None:
@@ -291,6 +316,65 @@ def do_scan(market, mode, day, force=False):
     save_state(market, day, st)
 
 
+def fx_history(day):
+    """Download missing Dukascopy sessions for a few minutes; again on the next tick until
+    nothing is missing. After the feed stops answering, wait FX_HISTORY_PAUSE_MIN minutes."""
+    fx = forex.config(signals.load_config())
+    st = load_state("FX", day)
+    if st.get("history_done") or not fx["dukascopy"]:
+        return
+    now = datetime.datetime.now(forex.LONDON)
+    wait = st.get("history_wait_until")
+    if wait and now.strftime("%H:%M") < wait:
+        return
+    res = forex.fill_history(symbols("FX"), fx, budget_s=FX_HISTORY_BUDGET_S, log=lambda t: None)
+    st = load_state("FX", day)
+    log("FX", day, "history: %d sessions downloaded from Dukascopy, %d still missing%s" % (
+        res["fetched"], res["missing"], (", stopped: " + res["stopped"]) if res["stopped"] else ""))
+    if not res["missing"]:
+        st["history_done"] = True
+    elif res["stopped"] and res["stopped"] != "out of time":
+        st["history_wait_until"] = (now + datetime.timedelta(minutes=FX_HISTORY_PAUSE_MIN)).strftime("%H:%M")
+    save_state("FX", day, st)
+
+
+def fx_orb(day, now=None, dry=False):
+    """One forex day-trade scan: every pair's London-open breakout, at most one signal."""
+    cfg = signals.load_config()
+    fx = forex.config(cfg)
+    now = now or datetime.datetime.now(forex.LONDON)
+    say = print if dry else (lambda t: log("FX", day, t))
+    st = {} if dry else load_state("FX", day)
+    sent_today = st.get("signals", [])
+    if len(sent_today) >= fx["max_signals_per_day"]:
+        return None
+    seen = set(st.get("notified", []))
+    sig = forex.scan(symbols("FX"), cfg, now, taken=sent_today, log=say, seen=seen)
+    if sig:
+        sig["day"] = day.isoformat()
+        sig["sent_at"] = now.strftime("%H:%M")
+        sig["bar_after"] = "%02d:%02d" % (now.hour, now.minute - now.minute % 5)
+        sig.pop("tried", None)
+        title, body = forex.message(sig)
+        if dry:
+            print("\n" + title + "\n" + body)
+            return sig
+        sent = notify(title, body)
+        sent_today.append(sig)
+        st["signals"] = sent_today
+        log("FX", day, "SIGNAL %s %s enter %s-%s stop %s target %s confidence %.0f%%, sent: %s" % (
+            sig["side"].upper(), show(sig["symbol"]), forex.px(sig["symbol"], sig["enter_lo"]),
+            forex.px(sig["symbol"], sig["enter_hi"]), forex.px(sig["symbol"], sig["stop"]),
+            forex.px(sig["symbol"], sig["target"]), sig["p_target"] * 100, ", ".join(sent) or "nowhere"))
+    if dry:
+        return sig
+    st["notified"] = sorted(seen)
+    st.setdefault("runs", []).append({"mode": "orb", "at": now.strftime("%H:%M"),
+                                      "hits": [k.split("@")[0] for k in sorted(seen)]})
+    save_state("FX", day, st)
+    return sig
+
+
 def run_swing(market, day, dry=False):
     """The once-a-day swing run: close out open swing trades, then send at most
     max_signals_per_day new ones. dry=True prints and changes nothing."""
@@ -300,21 +384,26 @@ def run_swing(market, day, dry=False):
     say = print if dry else (lambda t: log(market, day, t))
     if not sc["enabled"]:
         return
-    mod = load_scanner()
-    mod.use_market("NSE" if market == "NSE" else "NYSE")
+    fx_mkt = market == "FX"
+    if fx_mkt:
+        mod = forex.SwingClock()
+    else:
+        mod = load_scanner()
+        mod.use_market("NSE" if market == "NSE" else "NYSE")
     now = swing.utcnow()
     path = os.path.join(market_dir(market), "swing.json")
     book = swing.load_book(path)
     still, closed = swing.update_open(mod, book.get("open", []), sc, now)
     for p in closed:
-        title, body = swing.closed_message(market, show(p["symbol"]), p)
+        title, body = (forex.swing_closed_message(p) if fx_mkt else
+                       swing.closed_message(market, show(p["symbol"]), p))
         if dry:
             print(title + "\n" + body)
         else:
             sent = notify(title, body)
             log(market, day, "swing closed %s: %s %+.2fR, sent: %s" % (show(p["symbol"]), p["outcome"], p["R"],
                                                                       ", ".join(sent) or "nowhere"))
-    rows = [] if ml.config(cfg)["mode"] != "off" else None
+    rows = [] if ml.config(cfg)["mode"] != "off" and not fx_mkt else None   # no learned check for forex
     live, pool, as_of, failed = swing.scan(mod, symbols(market), sc, now, say, market=market, rows=rows)
     if rows:
         ml.write_swing_rows(market, rows)
@@ -323,15 +412,20 @@ def run_swing(market, day, dry=False):
         len(live), as_of, failed, len(symbols(market))))
     picks = []
     if len(still) < sc["max_open"]:
-        ranked = swing.choose(live, pool, sc, (cfg.get("sizing") or {}).get(market),
-                              skip={p["symbol"] for p in still}, log=say, cfg=cfg, market=market)
+        size = forex.config(cfg)["sizing"] if fx_mkt else (cfg.get("sizing") or {}).get(market)
+        ranked = swing.choose(live, pool, sc, size, skip={p["symbol"] for p in still}, log=say,
+                              cfg=None if fx_mkt else cfg, market=market)
         room = min(sc["max_signals_per_day"], max(0, sc["max_open"] - len(still)))
         ndir = os.path.join(market_dir(market), "swing-news")
         os.makedirs(ndir, exist_ok=True)
         for s in ranked:   # best first; the news check runs only until there are enough picks
             if len(picks) >= room:
                 break
-            blocked, note = signals.news_check(s["symbol"], ndir, cfg, market)
+            if fx_mkt:   # forex: no company news; name the big releases coming up
+                blocked, note = "", forex.calendar_soon(s["symbol"], datetime.datetime.now(forex.UTC), 2,
+                                                        forex.config(cfg))
+            else:
+                blocked, note = signals.news_check(s["symbol"], ndir, cfg, market)
             if blocked:
                 say("swing %s %s dropped: %s" % (s["symbol"], s["setup"], blocked))
                 continue
@@ -340,7 +434,8 @@ def run_swing(market, day, dry=False):
     else:
         say("swing: %d trades already open (limit %d), no new signal" % (len(still), sc["max_open"]))
     for s in picks:
-        title, body = swing.message(market, m["label"], show(s["symbol"]), s, sc["hold_days"], mod, s.get("note"))
+        title, body = (forex.swing_message(s, sc["hold_days"], s.get("note")) if fx_mkt else
+                       swing.message(market, m["label"], show(s["symbol"]), s, sc["hold_days"], mod, s.get("note")))
         if dry:
             print("\n" + title + "\n" + body)
             continue
@@ -400,7 +495,27 @@ def run_learn(market, day, send=True, say=None):
         save_state(market, day, st)
 
 
+def fx_report_text(day):
+    st = load_state("FX", day)
+    lines = ["📋 %s Forex · end of day %s" % (forex.FLAG, day.strftime("%a %-d %b")), ""]
+    sigs = st.get("signals", [])
+    if sigs:
+        lines.append("🟢 Day-trade signals today: %d" % len(sigs))
+        lines += forex.report_lines(sigs, datetime.datetime.now(forex.LONDON))
+    else:
+        lines.append("🟢 Day-trade signals today: none (nothing passed every check)")
+    seen = st.get("notified", [])
+    lines.append("🔎 Breakouts checked: %s" % (", ".join("%s at %s" % (show(k.split("@")[0]), k.split("@")[1])
+                                                         for k in seen) if seen else "none"))
+    runs = st.get("runs", [])
+    lines.append("⚙️ Scanner: %d scans ran" % len(runs))
+    lines += ["", "⚠️ Signals come from past prices. Not a promise or advice."]
+    return "\n".join(lines)
+
+
 def report_text(market, day):
+    if market == "FX":
+        return fx_report_text(day)
     m = MARKETS[market]
     st = load_state(market, day)
     lines = ["📋 %s %s · end of day %s" % (signals.FLAG.get(market, ""), market, day.strftime("%a %-d %b")), ""]
@@ -493,6 +608,8 @@ def due(market, now_local):
     m = MARKETS[market]
     t = now_local.time()
     for mode in MODES:
+        if mode not in m:   # forex has no daily or learn step
+            continue
         a, b = m[mode]
         if hhmm(a) <= t <= hhmm(b):
             return mode
@@ -566,7 +683,7 @@ def cmd_next(a):
                     closed[local.date()] = trading_day(market, local.date())[0]
                 if closed[local.date()]:
                     found[mode] = local
-            if len(found) == len(MODES):
+            if len(found) == len([x for x in MODES if x in m]):
                 break
             t += datetime.timedelta(minutes=5)
         print("%s:" % m["name"])
@@ -581,6 +698,13 @@ def cmd_signal(a):
     """Dry run of the signal pipeline on given symbols (or the latest scan's hits). Sends nothing."""
     market = a.market.upper()
     m = MARKETS[market]
+    if market == "FX":
+        now = forex.now_london(a.now)
+        sig = fx_orb(now.date(), now=now, dry=True)
+        if not sig:
+            print("No signal: nothing passed every check.")
+            return 1
+        return 0
     cfg = signals.load_config()
     if a.fresh_minutes is not None:
         cfg["fresh_minutes"] = a.fresh_minutes
@@ -629,8 +753,11 @@ def cmd_summary(a):
 
 def cmd_ml(a):
     cfg = signals.load_config()
+    if (a.market or "").upper() == "FX":
+        print("Forex has no learned (AI) check: its signals use the rules alone.")
+        return 0
     if a.action == "learn":
-        markets = [a.market.upper()] if a.market else list(MARKETS)
+        markets = [a.market.upper()] if a.market else [x for x in MARKETS if x != "FX"]   # no AI check for forex
         for market in markets:
             day = datetime.datetime.now(MARKETS[market]["tz"]).date()
             run_learn(market, day, send=False, say=print)
@@ -653,25 +780,25 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_tick)
     p = sub.add_parser("run")
-    p.add_argument("--market", required=True, choices=["NSE", "US", "nse", "us"])
+    p.add_argument("--market", required=True, choices=["NSE", "US", "FX", "nse", "us", "fx"])
     p.add_argument("--mode", required=True, choices=["daily", "orb"])
     p.add_argument("--no-notify", action="store_true", help="scan and log, send nothing")
     p.set_defaults(fn=cmd_run)
     p = sub.add_parser("next", help="when each market's next scans run, in that market's time and this machine's")
     p.set_defaults(fn=cmd_next)
     p = sub.add_parser("report")
-    p.add_argument("--market", required=True, choices=["NSE", "US", "nse", "us"])
+    p.add_argument("--market", required=True, choices=["NSE", "US", "FX", "nse", "us", "fx"])
     p.add_argument("--date")
     p.add_argument("--print", action="store_true", help="print it, send nothing")
     p.set_defaults(fn=cmd_report)
     p = sub.add_parser("signal", help="dry run of the signal checks; prints, sends nothing")
-    p.add_argument("--market", required=True, choices=["NSE", "US", "nse", "us"])
+    p.add_argument("--market", required=True, choices=["NSE", "US", "FX", "nse", "us", "fx"])
     p.add_argument("--symbols", help="comma-separated; default: the latest orb scan's hits")
     p.add_argument("--now", help='pretend it is this market-local time, "YYYY-MM-DD HH:MM"')
     p.add_argument("--fresh-minutes", type=int, help="override the freshness limit for this run")
     p.set_defaults(fn=cmd_signal)
     p = sub.add_parser("swing", help="the daily swing run; prints only unless --send")
-    p.add_argument("--market", required=True, choices=["NSE", "US", "nse", "us"])
+    p.add_argument("--market", required=True, choices=["NSE", "US", "FX", "nse", "us", "fx"])
     p.add_argument("--send", action="store_true", help="really send and record the signals")
     p.set_defaults(fn=cmd_swing)
     p = sub.add_parser("summary")
@@ -679,7 +806,7 @@ def main():
     p.set_defaults(fn=cmd_summary)
     p = sub.add_parser("ml", help="the learned signal check: status, or label and retrain now")
     p.add_argument("action", choices=["status", "learn"])
-    p.add_argument("--market", choices=["NSE", "US", "nse", "us"])
+    p.add_argument("--market", choices=["NSE", "US", "FX", "nse", "us", "fx"])
     p.set_defaults(fn=cmd_ml)
     p = sub.add_parser("test-notify")
     p.set_defaults(fn=cmd_test)

@@ -221,6 +221,7 @@ def choose(live, pool, sc, size, skip=(), log=lambda t: None, cfg=None, market=N
             log("swing %s %s: already open" % (c["symbol"], c["setup"]))
             continue
         best, why = None, ""
+        nd = signals.decimals(c["symbol"])
         for k in sc["targets_r"]:
             raw, pl = c["bt"][k], pool[(c["setup"], k)]
             m = sc["prior_trades"]
@@ -254,12 +255,19 @@ def choose(live, pool, sc, size, skip=(), log=lambda t: None, cfg=None, market=N
             if best is None or st["avg_r"] > best["avg_r"]:
                 lv = levels(c["close"], c["atr"], k, sc)
                 best = dict(st, k=k, pool_avg_r=pl["avg_r"], pool_n=pl["n"], ml=chk,
-                            **{x: round(v, 2) for x, v in lv.items()})
+                            **{x: round(v, nd) for x, v in lv.items()})
         if best is None:
             log("swing %s %s: %s" % (c["symbol"], c["setup"], why))
             continue
         pos = None
-        if size:
+        if size and market == "FX":
+            import forex
+            pos, why = forex.position(size, c["symbol"], best["buy_hi"], best["stop"], best["target"], "buy",
+                                      forex.config(signals.load_config()))
+            if pos is None:
+                log("swing %s %s: %s" % (c["symbol"], c["setup"], why))
+                continue
+        elif size:
             pos, why = signals.position(size, best["buy_hi"], best["stop"], best["target"])
             if pos is None:
                 log("swing %s %s: %s" % (c["symbol"], c["setup"], why))
@@ -268,7 +276,7 @@ def choose(live, pool, sc, size, skip=(), log=lambda t: None, cfg=None, market=N
         log("swing %s %s: PASS %.0f%% %+.2fR at %gR over %d trades" % (
             c["symbol"], c["setup"], best["conf"] * 100, best["avg_r"], best["k"], best["n"]))
         out.append({"symbol": c["symbol"], "setup": c["setup"], "date": c["date"].isoformat(),
-                    "close": round(c["close"], 2), "atr": round(c["atr"], 2), "years": round(c["years"], 1),
+                    "close": round(c["close"], nd), "atr": round(c["atr"], nd), "years": round(c["years"], 1),
                     "position": pos, **best})
     def rank(x):
         if ml.active(x.get("ml")):   # the learned odds, as an expected result in R
@@ -351,12 +359,13 @@ def update_open(mod, positions, sc, now_utc):
             still.append(p)
             continue
         t = walk(bars, idx[0], p, sc["hold_days"])
+        nd = signals.decimals(p["symbol"])
         if t is None or t["outcome"] == "open":
             if t:
-                p["entry"] = round(t["entry"], 2)
+                p["entry"] = round(t["entry"], nd)
             still.append(p)
             continue
-        p.update(outcome=t["outcome"], R=round(t["R"], 2), entry=round(t["entry"], 2),
+        p.update(outcome=t["outcome"], R=round(t["R"], 2), entry=round(t["entry"], nd),
                  closed_on=bars[t["exit_i"]]["d"].isoformat())
         closed.append(p)
     return still, closed

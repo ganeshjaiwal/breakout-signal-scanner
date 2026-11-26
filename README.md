@@ -1,8 +1,8 @@
 # breakout-signal-scanner
 
-Telegram signal bot for NIFTY 50 and US stocks: scans for breakouts every 5 minutes,
-checks each against 10,000 test runs on past prices, and sends day-trade and swing
-signals with buy range, sell range, stop loss and confidence.
+Telegram signal bot for NIFTY 50, US stocks and the seven major forex pairs: scans for
+breakouts every 5 minutes, checks each against 10,000 test runs on past prices, and sends
+day-trade and swing signals with buy range, sell range, stop loss and confidence.
 
 > ⚠️ **Not financial advice.** Signals come from past prices. They are not a promise,
 > trades can and will lose, and nothing here knows your finances. Most people who day
@@ -32,12 +32,16 @@ Open an issue or raise a pull request. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## What it does
 
-It watches two markets, each on its own clock and holiday calendar:
+It watches three markets, each on its own clock and holiday calendar:
 
-| Market | Stocks | Hours (local) | Day-trade scans | Swing run |
+| Market | Watches | Hours (local) | Day-trade scans | Swing run |
 | --- | --- | --- | --- | --- |
 | 🇮🇳 NSE | NIFTY 50 | 09:15–15:30 IST | every 5 min, 09:35–14:50 IST | 16:30 IST |
 | 🇺🇸 US | NASDAQ-100 + S&P 100 (about 167) | 09:30–16:00 New York | every 5 min, 09:50–15:30 New York | 17:00 New York |
+| 💱 Forex | EUR/USD, USD/JPY, GBP/USD, USD/CHF, AUD/USD, USD/CAD, NZD/USD | London session 08:00–16:00 London | every 5 min, 08:15–14:45 London | 01:15 London |
+
+Forex works differently from stocks (both directions, pips, lots, spread, an economic
+calendar instead of company news): see [Forex](#forex-the-seven-major-pairs).
 
 - **Day-trade signals:** opening-range breakouts, closed the same day (NSE by 15:15 IST,
   US by 15:55 New York time).
@@ -185,11 +189,59 @@ test. `ml learn` labels and retrains now. `"ml": {"mode": "shadow"}` keeps it wa
 **About the AI check:** it learns from past prices and is tested on past prices it did not
 train on. That is better than in-sample, but markets change. It can still be wrong.
 
+### Forex (the seven major pairs)
+
+`autoscan/forex.py` runs the same ideas on the pairs in `autoscan/lists/forex.txt`, with
+these differences:
+
+- **Clock:** the London session. The opening range is 08:00–08:15 London time, no new
+  entries after 14:30, close by 15:45. Messages give London time and IST.
+- **Both directions:** a close above the range is a 🟢 BUY, a close below it a 🔴 SELL.
+  Only the day's first break counts.
+- **Stop and targets:** stop at the other side of the opening range (`"stop": "range_mid"`
+  for its middle), targets at 1R, 1.5R and 2R, prices to the pair's last digit (5, or 3 for
+  yen pairs).
+- **Spread:** every result is counted after a typical retail spread per pair (EUR/USD 1.0
+  pip up to 2.0 for USD/CAD and NZD/USD). A stop closer than 5 spreads is refused.
+- **Economic calendar instead of news:** a high-impact release for either currency within
+  30 minutes blocks the signal; a later one before the close is named in the message
+  (Forex Factory's free weekly feed).
+- **One bet on the dollar:** at most 2 signals a day, and never two that make the same bet
+  on the US dollar (BUY EUR/USD and BUY GBP/USD both sell dollars).
+- **Swing:** the same four daily setups and 5-year backtest as stocks (long only), run at
+  01:15 London when the day's bar is complete. The message names big releases in the next
+  2 days and reminds you of the overnight swap.
+- **Two price feeds:** past sessions (the replays, the past-trades check, `study`) come
+  from Dukascopy's free tick history: real bid and ask quotes, up to 120 sessions instead
+  of Yahoo's 60 days. The bot downloads them a few minutes at a time between 17:00 and
+  23:30 London and keeps them in `autoscan/data/fx/dukascopy/`; any day not downloaded yet
+  comes from Yahoo. Today's live bars and the daily bars for swing trades still come from
+  Yahoo, because Dukascopy publishes each hour only after it ends. Dukascopy's feed is
+  unofficial and often refuses requests: the download stops after 3 failures, waits 30
+  minutes and carries on, so filling all 120 days can take several evenings.
+  `python3 autoscan/forex.py history` shows how many days come from each.
+- **No volume** (forex has none on free feeds) and **no AI check** for forex yet.
+
+**What the numbers said when this was added:** on the 59 London sessions to 26 Nov 2026,
+the plain London-open breakout on these seven pairs made a small profit before the spread
+(+0.01R to +0.24R a trade) and **lost after it** (−0.07R to −0.35R a trade, depending on the
+range length and stop). So the gates are strict: a signal needs a positive average after
+the spread in both the replays and that pair's own past sessions. Expect forex signals to
+be rare, and check your app's real spread. `python3 autoscan/forex.py study` reruns that
+comparison on the saved past sessions, and shows the spread Dukascopy measured.
+
+**Yahoo vs Dukascopy:** on the one session compared so far (EUR/USD, 25 Nov 2026), Yahoo's
+prices sat about 3 pips above Dukascopy's all day, and its 5-minute bars were about half as
+wide (median 2.4 vs 4.4 pips). Live opening ranges from Yahoo may therefore look tighter
+than the real market. Check this again once more days are downloaded.
+
+Forex trading is regulated differently in each country; check what is allowed where you live.
+
 ## Requirements
 
 - **Python 3.9 or newer.** Standard library only: there is nothing to `pip install`.
 - **Linux or macOS** with `cron` for automatic runs. Windows works for manual runs and in WSL.
-- **Internet access** to Yahoo Finance.
+- **Internet access** to Yahoo Finance (and, for forex, Dukascopy and Forex Factory).
 - **A Telegram account** for alerts (optional; Linux desktops also get pop-ups via `notify-send`).
 
 ## Quick start (try it on your computer)
@@ -333,14 +385,39 @@ discount-broker rates.
 | `ml.mode` | `"auto"` | AI check: `"auto"` blocks only once the model passes its test, `"shadow"` never blocks, `"off"` |
 
 Every key, with a comment, is in `DEFAULTS` at the top of
-[autoscan/signals.py](autoscan/signals.py), [autoscan/swing.py](autoscan/swing.py) and
-[autoscan/ml.py](autoscan/ml.py).
+[autoscan/signals.py](autoscan/signals.py), [autoscan/swing.py](autoscan/swing.py),
+[autoscan/ml.py](autoscan/ml.py) and [autoscan/forex.py](autoscan/forex.py).
 
-### Stock lists
+### Forex settings
+
+Forex has its own block, so the stock thresholds never apply to it:
+
+```json
+{ "forex": { "sizing": { "max_loss": 10 }, "spreads": { "EURUSD": 0.8 } } }
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `forex.sizing.max_loss` | not set | US dollars lost at the stop, spread included; the message then shows lots (0.01 steps) |
+| `forex.spreads` | typical retail | your app's spread per pair, in pips |
+| `forex.stop` | `"range_far"` | `"range_far"` other side of the opening range, `"range_mid"` its middle |
+| `forex.sides` | `["buy", "sell"]` | `["buy"]` for buy signals only |
+| `forex.min_risk_spreads` | `5` | stop at least this many spreads from the entry |
+| `forex.calendar_block_minutes` | `30` | a high-impact release this close to now blocks the signal |
+| `forex.max_signals_per_day` | `2` | forex day trades per day |
+| `forex.history_days` | `120` | past sessions used by the replays (Dukascopy, Yahoo for missing days) |
+| `forex.dukascopy` | `true` | `false`: Yahoo only (about 60 days), no evening download |
+
+The swing settings (`swing.*`) are shared with stocks.
+
+### Stock and pair lists
 
 `autoscan/lists/nifty50.txt` and `autoscan/lists/us.txt`, one symbol per line. NSE
 symbols are written without `.NS`. NSE changes the NIFTY 50 in March and September;
 the current list is at https://archives.nseindia.com/content/indices/ind_nifty50list.csv
+
+`autoscan/lists/forex.txt` holds the forex pairs, written like `EURUSD` (the bot adds
+Yahoo's `=X`).
 
 ## Commands
 
@@ -357,6 +434,12 @@ Run from `autoscan/`:
 | `python3 autoscan.py summary` | Today's scan hits, both markets |
 | `python3 autoscan.py test-notify` | Send a test message |
 | `python3 autoscan.py tick --dry-run --now "2026-11-23 20:30"` | What would run at that IST time |
+| `python3 autoscan.py signal --market FX --now "2026-11-25 08:40"` | Forex day-trade checks at a London time, prints only |
+| `python3 autoscan.py swing --market FX` | Forex swing checks, prints only |
+| `python3 forex.py calendar` | This week's high-impact releases, in IST |
+| `python3 forex.py study` | The forex rule's record on the saved past sessions, by setting, after the spread |
+| `python3 forex.py history` | How many past sessions per pair come from Dukascopy and from Yahoo |
+| `python3 forex.py fill --minutes 30` | Download missing Dukascopy sessions now (the bot does this every evening) |
 
 To stop it: `crontab -l | grep -v 'autoscan' | crontab -`
 
@@ -368,9 +451,11 @@ breakout-signal-scanner/
 │   ├── autoscan.py                cron runner: schedule, scans, Telegram, reports
 │   ├── signals.py                 day-trade pipeline and messages
 │   ├── swing.py                   swing pipeline, backtest and messages
+│   ├── forex.py                   forex: London-open breakouts, calendar, lots, swing clock
+│   ├── dukascopy.py               forex history: Dukascopy tick files to 5-minute bars
 │   ├── signal_config.json         shared defaults
 │   ├── signal_config.local.example.json
-│   ├── lists/                     the stocks it watches
+│   ├── lists/                     the stocks and forex pairs it watches
 │   └── deploy/                    install.sh, update.sh, make-bundle.sh, SERVER.md
 ├── day-trader-skill/              the Claude skills the bot is built on
 │   └── skills/                    scanner, entry, exit, timemachine, news, ...
@@ -393,8 +478,15 @@ scan results, signal records), `autoscan/cron.log` and `autoscan/update.log`.
   is a word list, not a full understanding of the article. SEC filings are not checked.
 - **Calendars:** NYSE holidays and early closes for 2026–2027, NSE holidays for 2026.
   Add the NSE 2027 list to `NSE_HOLIDAYS` in the skill scripts when NSE publishes it.
+  Forex skips weekends, 25 December and 1 January.
+- **Forex:** Dukascopy's free tick history for past sessions (unofficial, often slow or
+  down; the mid of its bid and ask, from an ECN, so its spread is tighter than a retail
+  app's), Yahoo's free `EURUSD=X`-style bars for today's live bars and the daily bars (a
+  quoted price, no volume), and Forex Factory's free weekly calendar feed (unofficial;
+  cached for 2 hours). Spreads are typical
+  values, not your app's live spread; overnight swap is not counted.
 - **Not modelled:** your broker's real fills, slippage and exact charges; circuit limits;
-  short selling (signals are buy-only).
+  short selling of stocks (stock signals are buy-only; forex day trades go both ways).
 - **Small budgets:** with a few thousand rupees, charges can eat most of the expected edge.
   The message shows estimated charges so you can judge.
 

@@ -61,6 +61,7 @@ DEFAULTS = {
     "sizing": {},
     "swing": {},                  # swing-signal settings, see swing.py DEFAULTS
     "ml": {},                     # the learned signal check, see ml.py DEFAULTS
+    "forex": {},                  # the forex market's own settings, see forex.py DEFAULTS
 }
 
 
@@ -391,6 +392,13 @@ def news_check(sym, workdir, cfg, market=None, info=None):
 
 def fmt(x):
     return ("%.2f" % x)
+
+
+def decimals(sym):
+    """Price digits: forex pairs (EURUSD=X) quote to 5, yen pairs to 3, stocks to 2."""
+    if str(sym).upper().endswith("=X"):
+        return 3 if "JPY" in str(sym).upper() else 5
+    return 2
 
 
 FLAG = {"NSE": "🇮🇳", "US": "🇺🇸"}

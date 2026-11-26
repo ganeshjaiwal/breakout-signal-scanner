@@ -15,9 +15,16 @@ markets on their own clock:
 | --- | --- | --- | --- |
 | NIFTY 50 | 08:45 IST | every 5 min, 09:35-14:50 IST | same |
 | US | 09:00 ET | every 5 min, 09:50-15:30 ET | 19:30 / 20:30-02:00 (winter), 18:30 / 19:30-01:00 (summer) |
+| Forex | none | every 5 min, 08:15-14:45 London | 13:45-20:15 (winter), 12:45-19:15 (summer) |
 
 Weekends and exchange holidays (NSE 2026, NYSE 2026-2027) are skipped. NSE has not
 published its 2027 holiday list yet: add it to the scanner's `NSE_HOLIDAYS` when it does.
+Forex skips weekends, 25 December and 1 January; its report runs at 16:00 London and its
+swing run at 01:15 London, after the day's UTC bar closes. Forex is checked in-process by
+`forex.py` (both directions, pips, spread, economic calendar), not by the stock skills.
+Forex also has a `history` step (17:00-23:30 London, weekdays) that downloads past sessions
+from Dukascopy a few minutes per tick into `data/fx/dukascopy/` (see `dukascopy.py`); the
+replays use those and fall back to Yahoo for days not downloaded yet. Live bars stay Yahoo.
 
 After the close each market also runs `swing` (NSE 16:30 IST, US 17:00 ET) and `learn`
 (NSE 17:05 IST, US 17:35 ET: labels the day's candidates and retrains the AI check, see `ml.py`).
@@ -97,6 +104,7 @@ python3 autoscan.py ml learn                              # label and retrain no
 - `data/<market>/signals/DATE/tried.jsonl`: every scored day-trade candidate, for learning
 - `data/ml/`: learning rows (`day.jsonl`, `swing-<market>.jsonl.gz`), models
   (`model-day.json`, `model-swing.json`) and every training's test result (`history.jsonl`)
+- `data/fx/dukascopy/<PAIR>/DATE.json`: forex past sessions from Dukascopy, kept for good
 - `cron.log`: cron's own output (errors land here)
 
 

@@ -1,0 +1,10 @@
+# Forex pairs for the FX market (Yahoo symbols get "=X" added: EURUSD -> EURUSD=X).
+# Core majors
+EURUSD
+USDJPY
+GBPUSD
+USDCHF
+# Commodity-linked majors
+AUDUSD
+USDCAD
+NZDUSD
